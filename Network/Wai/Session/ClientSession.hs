@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 module Network.Wai.Session.ClientSession (clientsessionStore) where
 
 import Control.Monad
@@ -13,22 +15,36 @@ import Data.Serialize (encode, decode, Serialize) -- Use cereal because clientse
 -- | Session store that keeps all content in a 'Serialize'd cookie encrypted
 -- with 'Web.ClientSession'
 --
+-- Decryption is deferred until the session is first read or written.
+-- The Set-Cookie header is skipped when the session is never accessed.
+--
 -- WARNING: This session is vulnerable to sidejacking,
 -- use with TLS for security.
 clientsessionStore :: (Serialize k, Serialize v, Eq k, MonadIO m) => Key -> SessionStore m k v
-clientsessionStore cryptKey (Just encoded) =
-	case hush . decode =<< decrypt cryptKey encoded of
-		Just sessionData -> backend cryptKey sessionData
-		-- Bad cookie is the same as no cookie
-		Nothing -> clientsessionStore cryptKey Nothing
-clientsessionStore cryptKey Nothing = backend cryptKey []
+clientsessionStore cryptKey maybeCookie = do
+	-- Pure + lazy: decryption thunk evaluated only when initialPairs is forced
+	let initialPairs = case maybeCookie of
+		Nothing -> []
+		Just encoded -> case hush . decode =<< decrypt cryptKey encoded of
+			Just sessionData -> sessionData
+			Nothing -> []
 
-backend :: (Serialize k, Serialize v, Eq k, MonadIO m) => Key -> [(k, v)] -> IO (Session m k v, IO ByteString)
-backend cryptKey sessionData = do
-	-- Don't need threadsafety because we only hand this IORef to an Application
-	-- through a single Request.
-	ref <- newIORef sessionData
+	-- Nothing = never accessed; Just (pairs, dirty) = accessed
+	ref <- newIORef Nothing
+
+	let ensureLoaded = readIORef ref >>= \case
+		Just (pairs, _) -> pure pairs
+		Nothing -> do
+			writeIORef ref (Just (initialPairs, False))
+			pure initialPairs
+
 	return ((
-			(\k -> lookup k `liftM` liftIO (readIORef ref)),
-			(\k v -> liftIO (modifyIORef ref (((k,v):) . filter ((/=k) . fst))))
-		), encryptIO cryptKey =<< encode `fmap` readIORef ref)
+			(\k -> lookup k `liftM` liftIO ensureLoaded),
+			(\k v -> liftIO $ do
+				pairs <- ensureLoaded
+				writeIORef ref (Just (((k,v):) . filter ((/=k) . fst) $ pairs, True)))
+		), readIORef ref >>= \case
+			Nothing            -> return Nothing      -- never accessed: skip Set-Cookie
+			Just (_, False)    -> return maybeCookie   -- read-only: echo original bytes
+			Just (pairs, True) -> Just <$> (encryptIO cryptKey $ encode pairs)
+		)
